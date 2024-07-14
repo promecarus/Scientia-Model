@@ -1,16 +1,48 @@
 from fastapi import FastAPI, Form, HTTPException, UploadFile, Query
-from marshal import loads
-from polars import read_csv
+from mpstemmer import MPStemmer
+from numpy import argsort
+from polars import read_csv, Series
 from PyPDF2 import PdfReader
+from re import sub
+from Sastrawi.StopWordRemover.StopWordRemoverFactory import StopWordRemoverFactory
 from sklearn.feature_extraction.text import TfidfVectorizer
-from types import FunctionType
+from sklearn.metrics.pairwise import cosine_similarity
 
 df = read_csv("temp/repository_pnj_20212023clean.csv")
 vectorizer = TfidfVectorizer()
 tfidf_matrix = vectorizer.fit_transform(df["f"].to_list())
 
-with open("temp/model.marshall", "rb") as file:
-    model = file.read()
+
+def find_similar_documents(title: str, abstract: str, top_n: int):
+    cosine_scores = cosine_similarity(
+        vectorizer.transform(
+            [
+                StopWordRemoverFactory()
+                .create_stop_word_remover()
+                .remove(
+                    MPStemmer().stem_kalimat(
+                        " ".join(
+                            sub(
+                                r"[^a-z]", " ", (title + " " + abstract).lower()
+                            ).split()
+                        )
+                    )
+                )
+            ]
+        ),
+        tfidf_matrix,
+    ).flatten()
+
+    top_n_indices = argsort(cosine_scores)[-top_n:][::-1]
+
+    return (
+        df[top_n_indices]
+        .with_columns(
+            Series(name="similarity", values=cosine_scores[top_n_indices] * 100)
+        )
+        .drop("f")
+    )
+
 
 app = FastAPI()
 
@@ -27,7 +59,7 @@ async def get_find_similar(
     top_n: int = Query(...),
 ):
     try:
-        return FunctionType(loads(model), globals())(
+        return find_similar_documents(
             title,
             abstract,
             top_n,
@@ -41,7 +73,7 @@ async def post_find_similar_pdf(file: UploadFile, top_n: int = Form(...)):
     pages = PdfReader(file.file).pages
 
     try:
-        return FunctionType(loads(model), globals())(
+        return find_similar_documents(
             pages[0].extract_text(),
             " ".join([page.extract_text() for page in pages[1:]]),
             top_n,
